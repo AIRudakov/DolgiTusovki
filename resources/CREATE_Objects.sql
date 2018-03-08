@@ -1,44 +1,127 @@
-create or replace function personal_balance(parm1 bigint, parm2 date)
-  returns table (Participant text,
-                 Date date,
-                 Balance numeric(38,2),
-                 Balance_For_Day numeric(38,2))
+create or replace function pair_balance(lender bigint, lendee bigint, to_date date)
+  returns TABLE(Lender          TEXT,
+                Lendee          TEXT,
+                Date            DATE,
+                Balance_By_Day  NUMERIC(38, 2),
+                Balance_To_Date NUMERIC(38, 2),
+                is_up_to_date   BOOLEAN
+  )
 as
 $body$
-  select 
-      initcap(concat_ws('', lrs.first_name, lrs.last_name)) as Participant,
-      cf.operation_timestamp::DATE as date,
-      sum(CASE WHEN cf.lender = $1 THEN cf.amount ELSE (-1*cf.amount) END) 
-        over (
-          partition by concat_ws('', lrs.first_name, lrs.last_name) 
-          order by operation_timestamp::DATE asc
-          ) as Balance,
-      sum(CASE WHEN cf.lender = $1 THEN cf.amount ELSE (-1*cf.amount) END) as Balance_For_Day
-  from Cash_Flows.Cash_Flow cf
-  join Cash_Flows.Participants lrs on (cf.lender = lrs.person_id)
-  join Cash_Flows.Participants lds on (cf.lendee = lds.person_id)
-  where lrs.person_id = $1 and lds.person_id = $1 and cf.operation_timestamp::DATE <= $2
-  group by operation_timestamp::DATE
-  order by operation_timestamp::DATE asc
+with src as (
+    SELECT
+      initcap(concat_ws(' ', lrs.first_name, lrs.last_name)) AS Lender,
+      initcap(concat_ws(' ', lds.first_name, lds.last_name)) AS Lendee,
+      cf.operation_timestamp :: DATE                         AS date,
+      sum(CASE WHEN cf.lender = $1
+        THEN cf.amount
+          ELSE (-1 * cf.amount) END)                         AS Balance_For_Day
+    FROM Cash_Flows.Cash_Flow cf
+      JOIN Cash_Flows.Participants lrs ON (cf.lender = lrs.person_id)
+      JOIN Cash_Flows.Participants lds ON (cf.lendee = lds.person_id)
+    WHERE ((lrs.person_id = $1 AND lds.person_id = $2) OR (lrs.person_id = $2 AND lds.person_id = $1))
+          AND cf.operation_timestamp :: DATE <= $3 :: DATE
+    GROUP BY
+      initcap(concat_ws(' ', lrs.first_name, lrs.last_name)),
+      initcap(concat_ws(' ', lds.first_name, lds.last_name)),
+      cf.lender,
+      operation_timestamp :: DATE
+)
+select src.*,
+  sum(src.Balance_For_Day) over (order by src.date asc) as to_date_balance,
+  CASE WHEN lead(Balance_For_Day) over (
+    ORDER BY date ASC
+    ) is null
+    THEN True
+  ELSE False END as Is_Last
+from src
+order by src.date
 $body$
 language sql;
 
 
-create or replace function personal_balance_all(parm1 bigint, parm2 date)
-  returns table (Participant text,
+create or replace function pair_balance_all(lender bigint, to_date date)
+  returns table (Lender text,
+                 Lendee text,
                  Date date,
-                 Balance numeric(38,2),
-                 Balance_For_Day numeric(38,2))
+                 Balance_By_Day numeric(38,2),
+                 Balance_To_Date numeric(38,2),
+                 is_up_to_date boolean)
 as
 $body$
-  select 
-      initcap(concat_ws('', lrs.first_name, lrs.last_name)) as Participant,
-      sum(CASE WHEN cf.lender = $1 THEN cf.amount ELSE (-1*cf.amount) END) as Balance_For_Day
-  from Cash_Flows.Cash_Flow cf
-  join Cash_Flows.Participants lrs on (cf.lender = lrs.person_id)
-  join Cash_Flows.Participants lds on (cf.lendee = lds.person_id)
-  where lrs.person_id = $1 and lds.person_id = $1 and cf.operation_timestamp::DATE <=$2
-  group by initcap(concat_ws('', lrs.first_name, lrs.last_name)), initcap(concat_ws('', lds.first_name, lds.last_name))
+with src as (
+    SELECT
+      initcap(concat_ws(' ', lrs.first_name, lrs.last_name)) AS Lender,
+      initcap(concat_ws(' ', lds.first_name, lds.last_name)) AS Lendee,
+      cf.operation_timestamp :: DATE                         AS date,
+      CASE WHEN cf.lender = $1
+        THEN TRUE
+      ELSE FALSE END                                            AS Is_Lender,
+      sum(CASE WHEN cf.lender = $1
+        THEN cf.amount
+          ELSE (-1 * cf.amount) END) over (PARTITION BY cf.lender, cf.lendee, cf.operation_timestamp::DATE
+        order by cf.operation_timestamp :: DATE asc)
+        AS Balance_For_Day
+    FROM Cash_Flows.Cash_Flow cf
+      JOIN Cash_Flows.Participants lrs ON (cf.lender = lrs.person_id)
+      JOIN Cash_Flows.Participants lds ON (cf.lendee = lds.person_id)
+    WHERE (lrs.person_id = $1 OR lds.person_id = $1)
+          AND cf.operation_timestamp :: DATE <= $2::DATE
+)
+select
+  src.Lender,
+  src.Lendee,
+  src.date,
+  src.Balance_For_Day as operation_amount,
+  sum(Balance_For_Day) over (PARTITION BY
+    CASE WHEN Is_Lender THEN lender ELSE Lendee END,
+    CASE WHEN Is_Lender THEN lendee ELSE Lender END
+    order by date asc) as cumulative_balance,
+  CASE WHEN lead(Balance_For_Day) over (PARTITION BY
+    CASE WHEN Is_Lender THEN lender ELSE Lendee END,
+    CASE WHEN Is_Lender THEN lendee ELSE Lender END
+    order by date asc) is null then True ELSE False end as Is_Last
+from src
+order by CASE WHEN Is_Lender THEN lender ELSE Lendee END
+$body$
+language sql;
+
+create or replace function pair_balance_to_date(lender bigint, lendee bigint, to_date date)
+  returns TABLE(Lender          TEXT,
+                Lendee          TEXT,
+                Last_Operation_Date DATE,
+                Provided_Date DATE,
+                Current_Balance  NUMERIC(38, 2)
+  )
+as
+$body$
+SELECT
+  CASE WHEN balance_by_day<0 THEN src.lendee ELSE src.lender END as Lender,
+  CASE WHEN balance_by_day<0 THEN src.lender ELSE src.lendee END as Lendee,
+  date,
+  $3::DATE,
+  Balance_To_Date  from pair_balance($1, $2, $3) src
+WHERE is_up_to_date is TRUE
+$body$
+language sql;
+
+create or replace function pair_balance_all_to_date(lender bigint, to_date date)
+  returns TABLE(Lender          TEXT,
+                Lendee          TEXT,
+                Last_Operation_Date DATE,
+                Provided_Date DATE,
+                Current_Balance  NUMERIC(38, 2)
+  )
+as
+$body$
+SELECT
+  CASE WHEN balance_by_day<0 THEN src.lendee ELSE src.lender END as Lender,
+  CASE WHEN balance_by_day<0 THEN src.lender ELSE src.lendee END as Lendee,
+  date,
+  $2::DATE,
+  Balance_To_Date
+from pair_balance_all($1, $2) src
+WHERE is_up_to_date is TRUE
 $body$
 language sql;
 
